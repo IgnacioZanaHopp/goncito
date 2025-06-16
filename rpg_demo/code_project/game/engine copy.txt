@@ -1,0 +1,466 @@
+import os
+import random
+import pygame
+import textwrap
+from pygame.locals import *
+from game.events import EventManager
+from game.db import save_npc_memory
+from game.conversation import ConversationManager
+
+class GameEngine:
+    def __init__(self, screen, openai_api_key: str):
+        pygame.init()
+        self.screen     = screen
+        self.clock      = pygame.time.Clock()
+        self.running    = True
+
+        # ── Pantalla y jugador ──
+        self.W, self.H     = screen.get_size()
+        self.tile          = 32
+        self.speed         = 150
+        self.player_pos    = [self.W//2, self.H//2]
+
+        # ── Fuentes ──
+        base_dir   = os.path.dirname(__file__)
+        fonts_dir  = os.path.join(base_dir, '..', 'assets', 'fonts')
+        self.font_title  = pygame.font.Font(os.path.join(fonts_dir, 'The Amazing Spider-Man.ttf'), 48)
+        self.font_button = pygame.font.Font(os.path.join(fonts_dir, 'CinzelDecorative-Regular.ttf'), 24)
+        self.font_main   = pygame.font.Font(os.path.join(fonts_dir, 'CinzelDecorative-Regular.ttf'), 18)
+        self.font_chat   = pygame.font.Font(os.path.join(fonts_dir, 'CinzelDecorative-Regular.ttf'), 14)
+        self.font_input  = pygame.font.Font(os.path.join(fonts_dir, 'CinzelDecorative-Regular.ttf'), 12)
+
+        # scroll chat
+        self.chat_scroll   = 0
+        self.visible_lines = (self.H - 200) // (self.font_chat.get_height() + 4)
+
+        # ── Estados ──
+        self.state        = 'menu'    # menu, whoami, char_select, char_create, game, levelup
+        self.selected     = None
+        self.player_name  = ""
+        self.player_bio   = ""
+        self.setup_stage  = 0         # 0 = nombre, 1 = biografía
+        self.chat_input   = ""
+
+        # ── Estadísticas por clase (nivel 1) ──
+        self.default_stats = {
+            'guerrero': {'level':1, 'power':10, 'defense':5,  'magic':3,  'xp':0},
+            'hechicero':{'level':1, 'power':4,  'defense':2,  'magic':12, 'xp':0},
+            'quimico':  {'level':1, 'power':6,  'defense':4,  'magic':8,  'xp':0},
+        }
+        self.player_stats = None
+        self.xp_threshold = 100
+
+        # ── Sprites jugables ──
+        P = os.path.join(base_dir, '..', 'assets', 'sprites', 'player')
+        self.keys     = ['guerrero','hechicero','quimico']
+        self.sprites  = {}
+        self.stories  = {
+            'guerrero': "Un guerrero curtido en mil batallas, defensor del reino.",
+            'hechicero':"Un mago erudito, experto en magia elemental.",
+            'quimico':  "Un alquimista ingenioso, maestro de pociones y brebajes."
+        }
+        for k in self.keys:
+            img = pygame.image.load(os.path.join(P, f"{k}.png")).convert_alpha()
+            self.sprites[k] = pygame.transform.scale(img, (self.tile, self.tile))
+
+        # rects selección
+        margin = 80
+        sep    = (self.W - 2*margin) // len(self.keys)
+        self.char_rects = [
+            pygame.Rect(
+                margin + i*sep + (sep-self.tile)//2,
+                self.H//2 - self.tile//2,
+                self.tile, self.tile
+            )
+            for i in range(len(self.keys))
+        ]
+
+        # ── Menú principal ──
+        M  = os.path.join(base_dir, '..', 'assets', 'menu')
+        bg = pygame.image.load(os.path.join(M, 'background.png')).convert()
+        self.menu_bg    = pygame.transform.scale(bg, (self.W, self.H))
+        btn    = pygame.image.load(os.path.join(M, 'button.png')).convert_alpha()
+        btn_hv = pygame.image.load(os.path.join(M, 'button_hover.png')).convert_alpha()
+        bw     = int(self.W * 0.3)
+        scale  = bw / btn.get_width()
+        bh     = int(btn.get_height() * scale)
+        self.btn_normal = pygame.transform.scale(btn,    (bw, bh))
+        self.btn_hover  = pygame.transform.scale(btn_hv, (bw, bh))
+        x0      = (self.W - bw)//2
+        y0      = self.H//2 - bh - 30
+        self.menu_buttons = [
+            ("Iniciar",     pygame.Rect(x0,         y0,        bw, bh)),
+            ("¿Quién soy?", pygame.Rect(x0,         y0+bh+20, bw, bh))
+        ]
+
+        # ── Mapa y máscara de camino ──
+        MP = os.path.join(base_dir, '..', 'assets', 'maps')
+        m0 = pygame.image.load(os.path.join(MP, 'fondo_pueblo.png')).convert()
+        self.map_img = pygame.transform.scale(m0, (self.W, self.H))
+        w0 = pygame.image.load(os.path.join(MP, 'pradera_walk.png')).convert_alpha()
+        self.mask = pygame.transform.scale(w0, (self.W, self.H))
+
+        # ── NPCs ──
+        self.npcs = [
+            {'name':'carlos','alert':False,'story':"Carlos el herrero comenta sus viejas gestas."},
+            {'name':'lina',  'alert':False,'story':"Lina la herborista susurra secretos del bosque."},
+            {'name':'eldar', 'alert':False,'story':"Eldar el arcano recita pergaminos de antaño."}
+        ]
+        valid = []
+        for y in range(0, self.H, self.tile):
+            for x in range(0, self.W, self.tile):
+                cx, cy = x+self.tile//2, y+self.tile//2
+                if self.mask.get_at((cx, cy))[3] > 0:
+                    valid.append((x, y))
+        pts = random.sample(valid, len(self.npcs))
+        for npc, pos in zip(self.npcs, pts):
+            npc['pos']   = [pos[0], pos[1]]
+            npc['state'] = 'idle'
+            npc['timer'] = random.uniform(1,2)
+            x,y = pos
+            npc['area']  = [x-50, y-50, x+50, y+50]
+            npc['dir']   = (0,0)
+
+        self.bubbles      = []
+        self.chat_history = []
+
+        # ── Chat & eventos ──
+        self.conv        = ConversationManager(openai_api_key)
+        self.chat_active = False
+        self.chat_npc    = None
+        from game.emotion import EmotionEngine
+        self.e_engine = EmotionEngine([n['name'] for n in self.npcs])
+        self.events   = EventManager(
+            event_list=[
+                ("Tormenta","Se desata una tormenta de viento."),
+                ("Niebla",  "La niebla reduce la visibilidad."),
+                ("Festival","La aldea celebra un festival.")
+            ],
+            emotion_engine=self.e_engine,
+            save_memory_fn=save_npc_memory,
+            on_event_callback=self._on_event,
+            interval=60.0,
+            history_size=5
+        )
+        self.cur_event = ""
+        self.ev_timer  = 0.0
+
+    def run(self):
+        while self.running:
+            dt = self.clock.tick(60)/1000
+            for e in pygame.event.get():
+                self.handle_event(e)
+
+            if self.state=='game' and not self.chat_active:
+                self.handle_move(dt)
+                self._wander(dt)
+                self._bubbles(dt)
+                self.events.update(dt, self.npcs)
+                self._npc_states()
+                self._ev_update(dt)
+
+            self.draw()
+        pygame.quit()
+
+    def handle_event(self, event):
+        if event.type == QUIT:
+            self.running = False
+
+        # ── Menú ──
+        if self.state=='menu' and event.type==MOUSEBUTTONDOWN:
+            mx,my = event.pos
+            for txt,rect in self.menu_buttons:
+                if rect.collidepoint(mx,my):
+                    if txt=="Iniciar":
+                        self.state='char_select'
+                    else:
+                        self.state='whoami'
+        if self.state=='menu' and event.type==KEYDOWN and event.key==K_ESCAPE:
+            self.running = False
+
+        # ── WhoAmI ──
+        if self.state=='whoami' and event.type==KEYDOWN and event.key==K_ESCAPE:
+            self.state='menu'
+
+        # ── Selección personaje ──
+        if self.state=='char_select' and event.type==MOUSEBUTTONDOWN:
+            mx,my = event.pos
+            for i,rect in enumerate(self.char_rects):
+                if rect.collidepoint(mx,my):
+                    self.selected     = self.keys[i]
+                    self.player_stats = self.default_stats[self.selected].copy()
+                    self.setup_stage  = 0
+                    self.chat_input   = ""
+                    self.state        = 'char_create'
+        if self.state=='char_select' and event.type==KEYDOWN and event.key==K_ESCAPE:
+            self.state='menu'
+
+        # ── Creación personaje ──
+        if self.state=='char_create' and event.type==KEYDOWN:
+            if event.key==K_BACKSPACE:
+                self.chat_input = self.chat_input[:-1]
+            elif event.key in (K_RETURN,K_KP_ENTER):
+                if self.setup_stage==0:
+                    self.player_name = self.chat_input.strip() or "Anónimo"
+                    self.chat_input  = ""
+                    self.setup_stage = 1
+                else:
+                    self.player_bio  = self.chat_input.strip() or "Viajero sin historia."
+                    self.player_pos  = [self.W//2, self.H//2]
+                    self.state       = 'game'
+            else:
+                if event.unicode.isprintable():
+                    self.chat_input += event.unicode
+        if self.state=='char_create' and event.type==KEYDOWN and event.key==K_ESCAPE:
+            self.state='char_select'
+
+        # ── Juego ──
+        if self.state=='game':
+            # Nivel up activado: tecla M simula misión completada
+            if event.type==KEYDOWN and event.key==K_m:
+                self.player_stats['xp'] += 20
+                if self.player_stats['xp'] >= self.xp_threshold:
+                    self.player_stats['xp'] -= self.xp_threshold
+                    self.player_stats['level'] += 1
+                    self.state = 'levelup'
+
+            if event.type==MOUSEBUTTONDOWN and self.chat_active:
+                if event.button==4 and self.chat_scroll<max(0,len(self.chat_history)-self.visible_lines):
+                    self.chat_scroll += 1
+                elif event.button==5 and self.chat_scroll>0:
+                    self.chat_scroll -= 1
+
+            if event.type==KEYDOWN:
+                if self.state=='levelup':
+                    # elegir atributo a mejorar
+                    if event.key==K_1:
+                        self.player_stats['power'] += 1
+                        self.state='game'
+                    elif event.key==K_2:
+                        self.player_stats['defense'] += 1
+                        self.state='game'
+                    elif event.key==K_3:
+                        self.player_stats['magic'] += 1
+                        self.state='game'
+
+                elif event.key==K_ESCAPE:
+                    if self.chat_active:
+                        self.chat_active=False
+                        self.chat_input=""
+                        self.chat_scroll=0
+                    else:
+                        self.running=False
+                elif event.key==K_t:
+                    npc = self._near()
+                    if npc:
+                        greeting = self.conv.start_chat(npc['name'])
+                        self.chat_active  = True
+                        self.chat_npc     = npc
+                        self.chat_history = [(npc['name'], greeting)]
+                        self.chat_input   = ""
+                        self.chat_scroll  = 0
+                elif self.chat_active:
+                    if event.key==K_BACKSPACE:
+                        self.chat_input = self.chat_input[:-1]
+                    elif event.key in (K_RETURN,K_KP_ENTER):
+                        msg = self.chat_input.strip()
+                        if msg:
+                            self.chat_history.append(('tú', msg))
+                            resp = self.conv.send_message(self.chat_npc['name'], msg)
+                            self.chat_history.append((self.chat_npc['name'], resp))
+                        self.chat_input = ""
+                    else:
+                        if event.unicode.isprintable():
+                            self.chat_input += event.unicode
+                elif event.key==K_h:
+                    npc = self._near()
+                    if npc:
+                        self.bubbles.append({'npc': self.npcs.index(npc),
+                                             'msg': npc['story'],
+                                             'timer': 5.0})
+                elif event.key==K_v:
+                    self.interact(0,1,turns=4)
+
+    def handle_move(self, dt):
+        keys = pygame.key.get_pressed()
+        dx = dy = 0
+        if keys[K_w]: dy -= self.speed * dt
+        if keys[K_s]: dy += self.speed * dt
+        if keys[K_a]: dx -= self.speed * dt
+        if keys[K_d]: dx += self.speed * dt
+        self.player_pos[0] += dx
+        self.player_pos[1] += dy
+
+    def _wander(self, dt):
+        w,h = self.mask.get_size()
+        for npc in self.npcs:
+            npc['timer'] -= dt
+            if npc['timer'] <= 0:
+                if npc['state']=='idle':
+                    npc['state']='wander'
+                    npc['timer']=random.uniform(1,3)
+                    npc['dir']=random.choice([(1,0),(-1,0),(0,1),(0,-1)])
+                else:
+                    npc['state']='idle'
+                    npc['timer']=random.uniform(1,2)
+
+            if npc['state']=='wander':
+                sp = self.speed * 0.2
+                dx,dy = npc['dir'][0]*sp*dt, npc['dir'][1]*sp*dt
+                nx,ny = npc['pos'][0]+dx, npc['pos'][1]+dy
+                x0,y0,x1,y1 = npc['area']
+                if not(x0<=nx<=x1 and y0<=ny<=y1):
+                    npc['state']='idle'; npc['timer']=random.uniform(1,2)
+                    continue
+                cx = min(max(int(nx+self.tile/2),0),w-1)
+                cy = min(max(int(ny+self.tile/2),0),h-1)
+                if self.mask.get_at((cx,cy))[3]>0:
+                    npc['pos']=[nx,ny]
+                else:
+                    npc['state']='idle'; npc['timer']=random.uniform(1,2)
+
+    def _near(self):
+        for npc in self.npcs:
+            dx = self.player_pos[0] - npc['pos'][0]
+            dy = self.player_pos[1] - npc['pos'][1]
+            if abs(dx)<self.tile and abs(dy)<self.tile:
+                return npc
+        return None
+
+    def _npc_states(self):
+        flag = bool(self.cur_event)
+        for n in self.npcs:
+            n['alert'] = flag
+
+    def _bubbles(self, dt):
+        for b in self.bubbles:
+            b['timer'] -= dt
+        self.bubbles = [b for b in self.bubbles if b['timer']>0]
+
+    def _on_event(self, msg):
+        self.cur_event = msg
+        self.ev_timer  = 3.0
+
+    def _ev_update(self, dt):
+        if self.ev_timer>0:
+            self.ev_timer -= dt
+            if self.ev_timer<=0:
+                self.cur_event = ""
+
+    def interact(self, i1, i2, turns=3):
+        n1,n2 = self.npcs[i1], self.npcs[i2]
+        _ = self.conv.start_chat(n1['name'])
+        _ = self.conv.start_chat(n2['name'])
+        last = ""
+        for i in range(turns):
+            spk,lst = (n1,n2) if i%2==0 else (n2,n1)
+            prm = last if last else lst['story']
+            r   = self.conv.send_message(spk['name'], prm)
+            last = r
+            self.bubbles.append({'npc': self.npcs.index(spk),'msg':r,'timer':4.0})
+
+    def draw(self):
+        if self.state=='menu':
+            self.screen.blit(self.menu_bg, (0,0))
+            sombra = self.font_title.render("Mi RPG Demo", True, (0,0,0))
+            texto  = self.font_title.render("Mi RPG Demo", True, (255,223,0))
+            pos    = texto.get_rect(center=(self.W//2, 80))
+            self.screen.blit(sombra, pos.move(2,2))
+            self.screen.blit(texto, pos)
+            mx,my = pygame.mouse.get_pos()
+            for label, rect in self.menu_buttons:
+                over = rect.collidepoint(mx,my)
+                img  = self.btn_hover if over else self.btn_normal
+                self.screen.blit(img, rect.topleft)
+                txt_surf = self.font_button.render(label, True, (255,223,0))
+                self.screen.blit(txt_surf, txt_surf.get_rect(center=rect.center))
+
+        elif self.state=='whoami':
+            panel = pygame.Surface((self.W-100,self.H-150),pygame.SRCALPHA)
+            panel.fill((0,0,0,180))
+            self.screen.blit(panel,(50,50))
+            t1 = self.font_title.render("¿Quién soy?",True,(255,223,0))
+            self.screen.blit(t1,t1.get_rect(center=(self.W//2,120)))
+            lines=[
+                f"Nombre: {self.player_name or 'Ignacio Zanartu'}",
+                "Estudiante de Ing. Informática.",
+                "Tesis: IA narrativa para NPCs en un RPG.",
+                "Con Pygame, SQLite y OpenAI.",
+                "",
+                "Presiona ESC para volver."
+            ]
+            y=180
+            for ln in lines:
+                surf=self.font_main.render(ln,True,(200,200,200))
+                self.screen.blit(surf,surf.get_rect(center=(self.W//2,y)))
+                y+=self.font_main.get_height()+8
+
+        elif self.state=='char_select':
+            panel=pygame.Surface((self.W-100,self.H-150),pygame.SRCALPHA)
+            panel.fill((10,10,10,200))
+            self.screen.blit(panel,(50,50))
+            s1=self.font_title.render("Selecciona personaje",True,(0,0,0))
+            s2=self.font_title.render("Selecciona personaje",True,(255,223,0))
+            p2=s2.get_rect(center=(self.W//2,100))
+            self.screen.blit(s1,p2.move(2,2));self.screen.blit(s2,p2)
+            names=["Guerrero","Hechicero","Químico"]
+            for i,k in enumerate(self.keys):
+                x,y = self.char_rects[i].topleft
+                self.screen.blit(self.sprites[k],(x,y))
+                # etiqueta y stats
+                label_surf=self.font_button.render(names[i],True,(255,223,0))
+                self.screen.blit(label_surf,(x+(self.tile-label_surf.get_width())//2,y+self.tile+8))
+                stats=self.default_stats[k]
+                stat_line=f"Lv{stats['level']} Pwr:{stats['power']} Def:{stats['defense']} Mag:{stats['magic']}"
+                st_surf=self.font_main.render(stat_line,True,(200,200,200))
+                self.screen.blit(st_surf,(x+(self.tile-st_surf.get_width())//2,y+self.tile+32))
+            inst=self.font_main.render("Esc para volver",True,(200,200,200))
+            self.screen.blit(inst,(20,self.H-40))
+
+        elif self.state=='char_create':
+            self.screen.fill((30,30,30))
+            prompt="Escribe tu nombre:" if self.setup_stage==0 else "Escribe tu historia:"
+            self.screen.blit(self.font_main.render(prompt,True,(255,255,255)),(50,50))
+            ib=pygame.Rect(50,100,self.W-100,self.font_input.get_height()+10)
+            pygame.draw.rect(self.screen,(255,255,255),ib,2)
+            self.screen.blit(self.font_input.render(self.chat_input,True,(255,255,255)),(ib.x+5,ib.y+5))
+            y0=ib.bottom+20
+            for key in self.keys:
+                for ln in textwrap.wrap(self.stories[key],width=60):
+                    self.screen.blit(self.font_main.render(ln,True,(180,180,180)),(50,y0))
+                    y0+=self.font_main.get_height()+2
+                y0+=10
+
+        elif self.state=='levelup':
+            panel=pygame.Surface((self.W-300,200),pygame.SRCALPHA)
+            panel.fill((0,0,0,200))
+            self.screen.blit(panel,((self.W-300)//2,(self.H-200)//2))
+            prompt="¡Nivel {}! Escoge atributo: [1]Pwr [2]Def [3]Mag".format(self.player_stats['level'])
+            txt=self.font_main.render(prompt,True,(255,223,0))
+            self.screen.blit(txt,txt.get_rect(center=(self.W//2,self.H//2)))
+
+        else:  # juego
+            self.screen.blit(self.map_img,(0,0))
+            hdr=self.font_title.render("Mini RPG Narrativo",True,(255,255,255))
+            self.screen.blit(hdr,hdr.get_rect(center=(self.W//2,40)))
+            for npc in self.npcs:
+                col=(255,255,0) if npc['alert'] else (255,0,0)
+                pygame.draw.rect(self.screen,col,(*npc['pos'],self.tile,self.tile))
+            for b in self.bubbles:
+                lines=textwrap.wrap(b['msg'],width=25)
+                x,y=self.npcs[b['npc']]['pos']
+                y0=y-(len(lines)*(self.font_chat.get_height()+2))-10
+                w=max(self.font_chat.size(ln)[0] for ln in lines)+10
+                surf=pygame.Surface((w,len(lines)*(self.font_chat.get_height()+4)+4),pygame.SRCALPHA)
+                surf.fill((0,0,0,180))
+                yy=2
+                for ln in lines:
+                    t=self.font_chat.render(ln,True,(255,255,255))
+                    surf.blit(t,(5,yy))
+                    yy+=self.font_chat.get_height()+2
+                self.screen.blit(surf,(x,y0))
+            if self.selected:
+                px,py=int(self.player_pos[0]),int(self.player_pos[1])
+                self.screen.blit(self.sprites[self.selected],(px,py))
+
+        pygame.display.flip()

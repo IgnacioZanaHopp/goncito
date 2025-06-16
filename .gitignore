@@ -1,0 +1,9 @@
+# Entornos virtuales
+venv/
+npc-ai/
+# Archivos compilados
+*.pyc
+__pycache__/
+# Binarios pesados
+*.dll
+*.lib
